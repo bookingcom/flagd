@@ -200,12 +200,12 @@ func Test_SyncsFromFromConfig(t *testing.T) {
 				logger: lg,
 				sources: []sync.SourceConfig{
 					{
-						URI:        "grpc://host:port",
-						Provider:   syncProviderGrpc,
-						ProviderID: "myapp",
-						CertPath:   "/tmp/ca.cert",
-						Selector:   "source=database",
-						MaxMsgSize: 10,
+						URI:           "grpc://host:port",
+						Provider:      syncProviderGrpc,
+						ProviderID:    "myapp",
+						CertPath:      "/tmp/ca.cert",
+						Selector:      "source=database",
+						MaxMsgSize:    10,
 						ServAuthority: "target-service",
 					},
 				},
