@@ -36,6 +36,7 @@ type Config struct {
 	ServiceKeyPath     string
 	ServicePort        uint16
 	ServiceSocketPath  string
+	ServerAuthority    string
 	SyncServicePort    uint16
 
 	SyncProviders []sync.SourceConfig
@@ -77,7 +78,11 @@ func FromConfig(logger *logger.Logger, version string, config Config) (*Runtime,
 	s := store.NewFlags()
 	sources := []string{}
 
-	for _, provider := range config.SyncProviders {
+	for i, provider := range config.SyncProviders {
+		if provider.Provider == "grpc" && config.ServerAuthority != "" {
+            config.SyncProviders[i].ServAuthority = config.ServerAuthority
+        }
+		
 		s.FlagSources = append(s.FlagSources, provider.URI)
 		s.SourceMetadata[provider.URI] = store.SourceDetails{
 			Source:   provider.URI,
