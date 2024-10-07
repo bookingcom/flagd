@@ -34,6 +34,7 @@ const (
 	sourcesFlagName            = "sources"
 	syncPortFlagName           = "sync-port"
 	uriFlagName                = "uri"
+	serverAuthorityFlagName    = "server-authority"
 )
 
 func init() {
@@ -48,6 +49,7 @@ func init() {
 	flags.Int32P(syncPortFlagName, "g", 8015, "gRPC Sync port")
 	flags.Int32P(ofrepPortFlagName, "r", 8016, "ofrep service port")
 
+	flags.StringP(serverAuthorityFlagName, "a", "", "Set the server authority for gRPC connections")
 	flags.StringP(socketPathFlagName, "d", "", "Flagd socket path. "+
 		"With grpc the service will become available on this address. "+
 		"With http(s) the grpc-gateway proxy will use this address internally.")
@@ -94,6 +96,7 @@ func init() {
 	_ = viper.BindPFlag(uriFlagName, flags.Lookup(uriFlagName))
 	_ = viper.BindPFlag(syncPortFlagName, flags.Lookup(syncPortFlagName))
 	_ = viper.BindPFlag(ofrepPortFlagName, flags.Lookup(ofrepPortFlagName))
+	_ = viper.BindPFlag(serverAuthorityFlagName, flags.Lookup(serverAuthorityFlagName))
 }
 
 // startCmd represents the start command
@@ -154,6 +157,7 @@ var startCmd = &cobra.Command{
 			ServicePort:        viper.GetUint16(portFlagName),
 			ServiceSocketPath:  viper.GetString(socketPathFlagName),
 			SyncServicePort:    viper.GetUint16(syncPortFlagName),
+			ServerAuthority:    viper.GetString(serverAuthorityFlagName),
 			SyncProviders:      syncProviders,
 		})
 		if err != nil {

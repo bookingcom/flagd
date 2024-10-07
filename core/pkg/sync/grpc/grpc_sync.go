@@ -169,7 +169,7 @@ func (g *Sync) connectWithRetry(
 			return nil, false
 		}
 
-		g.Logger.Warn(fmt.Sprintf("connection re-establishment attempt in-progress for grpc target: %s", g.URI))
+		g.Logger.Warn(fmt.Sprintf("connection re-establishment attempt in-progress for grpc target: %s and authority: %s", g.URI, g.ServAuthority))
 
 		syncClient, err := g.client.SyncFlags(ctx, &v1.SyncFlagsRequest{ProviderId: g.ProviderID, Selector: g.Selector})
 		if err != nil {
@@ -177,7 +177,7 @@ func (g *Sync) connectWithRetry(
 			continue
 		}
 
-		g.Logger.Info(fmt.Sprintf("connection re-established with grpc target: %s", g.URI))
+		g.Logger.Info(fmt.Sprintf("connection re-established with grpc target: %s and authority: %s", g.URI, g.ServAuthority))
 		return syncClient, true
 	}
 }
