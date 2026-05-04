@@ -286,6 +286,11 @@ func NewHTTP(config sync.SourceConfig, logger *logger.Logger, poller polling.Pol
 		}
 	}
 
+	canonicalHeaders := make(map[string]string, len(config.Headers))
+	for k, v := range config.Headers {
+		canonicalHeaders[http.CanonicalHeaderKey(k)] = v
+	}
+
 	return &Sync{
 		uri: config.URI,
 		logger: logger.WithFields(
@@ -293,7 +298,7 @@ func NewHTTP(config sync.SourceConfig, logger *logger.Logger, poller polling.Pol
 			zap.String("sync", "http"),
 		),
 		authHeader:      config.AuthHeader,
-		headers:         config.Headers,
+		headers:         canonicalHeaders,
 		interval:        interval,
 		poller:          poller,
 		oauthCredential: oauthCredential,

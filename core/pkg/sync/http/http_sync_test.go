@@ -320,41 +320,6 @@ func TestHTTPSync_Fetch(t *testing.T) {
 	}
 }
 
-func TestHTTPSync_CustomHeaders(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	mockClient := syncmock.NewMockClient(ctrl)
-
-	customHeaders := map[string]string{
-		"X-Interop-Gateway-Host": "myhost",
-		"X-Tenant-ID":           "tenant1",
-	}
-
-	mockClient.EXPECT().Do(gomock.Any()).DoAndReturn(func(req *http.Request) (*http.Response, error) {
-		for key, expectedVal := range customHeaders {
-			actual := req.Header.Get(key)
-			if actual != expectedVal {
-				t.Errorf("expected header %s to be '%s', got '%s'", key, expectedVal, actual)
-			}
-		}
-		return &http.Response{
-			Header:     buildHeaders(map[string][]string{"Content-Type": {"application/json"}}),
-			Body:       io.NopCloser(strings.NewReader("test response")),
-			StatusCode: http.StatusOK,
-		}, nil
-	})
-
-	httpSync := Sync{
-		uri:     "http://localhost",
-		client:  mockClient,
-		headers: customHeaders,
-		logger:  logger.NewLogger(nil, false),
-	}
-
-	fetched, err := httpSync.Fetch(context.Background())
-	require.NoError(t, err)
-	require.Equal(t, "test response", fetched)
-}
-
 func TestNewHTTP_PassesHeaders(t *testing.T) {
 	headers := map[string]string{"X-Custom": "value"}
 	config := sync.SourceConfig{
@@ -366,88 +331,70 @@ func TestNewHTTP_PassesHeaders(t *testing.T) {
 	require.Equal(t, headers, httpSync.headers)
 }
 
-func TestHTTPSync_HostHeader(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	mockClient := syncmock.NewMockClient(ctrl)
-
-	mockClient.EXPECT().Do(gomock.Any()).DoAndReturn(func(req *http.Request) (*http.Response, error) {
-		require.Equal(t, "custom-host.example.com", req.Host)
-		require.Empty(t, req.Header.Get("Host"))
-		return &http.Response{
-			Header:     buildHeaders(map[string][]string{"Content-Type": {"application/json"}}),
-			Body:       io.NopCloser(strings.NewReader("{}")),
-			StatusCode: http.StatusOK,
-		}, nil
-	})
-
-	httpSync := Sync{
-		uri:     "http://localhost",
-		client:  mockClient,
-		headers: map[string]string{"Host": "custom-host.example.com"},
-		logger:  logger.NewLogger(nil, false),
-	}
-
-	_, err := httpSync.Fetch(context.Background())
-	require.NoError(t, err)
-}
-
-func TestHTTPSync_HeadersOverwriteAuth(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	mockClient := syncmock.NewMockClient(ctrl)
-
-	mockClient.EXPECT().Do(gomock.Any()).DoAndReturn(func(req *http.Request) (*http.Response, error) {
-		// Custom headers are applied after authHeader, so they take precedence
-		require.Equal(t, "Bearer custom-token", req.Header.Get("Authorization"))
-		require.Equal(t, "custom-value", req.Header.Get("X-Custom"))
-		return &http.Response{
-			Header:     buildHeaders(map[string][]string{"Content-Type": {"application/json"}}),
-			Body:       io.NopCloser(strings.NewReader("{}")),
-			StatusCode: http.StatusOK,
-		}, nil
-	})
-
-	httpSync := Sync{
-		uri:        "http://localhost",
-		client:     mockClient,
-		authHeader: "Bearer original-token",
-		headers: map[string]string{
-			"Authorization": "Bearer custom-token",
-			"X-Custom":      "custom-value",
+func TestHTTPSync_CustomHeaders(t *testing.T) {
+	tests := map[string]struct {
+		authHeader     string
+		headers        map[string]string
+		assertRequest  func(t *testing.T, req *http.Request)
+	}{
+		"injects custom headers": {
+			headers: map[string]string{"X-Interop-Gateway-Host": "myhost", "X-Tenant-ID": "tenant1"},
+			assertRequest: func(t *testing.T, req *http.Request) {
+				require.Equal(t, "myhost", req.Header.Get("X-Interop-Gateway-Host"))
+				require.Equal(t, "tenant1", req.Header.Get("X-Tenant-ID"))
+			},
 		},
-		logger: logger.NewLogger(nil, false),
-	}
-
-	_, err := httpSync.Fetch(context.Background())
-	require.NoError(t, err)
-}
-
-func TestHTTPSync_AuthHeaderWithoutOverride(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	mockClient := syncmock.NewMockClient(ctrl)
-
-	mockClient.EXPECT().Do(gomock.Any()).DoAndReturn(func(req *http.Request) (*http.Response, error) {
-		// When custom headers don't include Authorization, authHeader is preserved
-		require.Equal(t, "Bearer token123", req.Header.Get("Authorization"))
-		require.Equal(t, "custom-value", req.Header.Get("X-Custom"))
-		return &http.Response{
-			Header:     buildHeaders(map[string][]string{"Content-Type": {"application/json"}}),
-			Body:       io.NopCloser(strings.NewReader("{}")),
-			StatusCode: http.StatusOK,
-		}, nil
-	})
-
-	httpSync := Sync{
-		uri:        "http://localhost",
-		client:     mockClient,
-		authHeader: "Bearer token123",
-		headers: map[string]string{
-			"X-Custom": "custom-value",
+		"sets Host header via req.Host": {
+			headers: map[string]string{"Host": "custom-host.example.com"},
+			assertRequest: func(t *testing.T, req *http.Request) {
+				require.Equal(t, "custom-host.example.com", req.Host)
+				require.Empty(t, req.Header.Get("Host"))
+			},
 		},
-		logger: logger.NewLogger(nil, false),
+		"custom headers override authHeader": {
+			authHeader: "Bearer original-token",
+			headers:    map[string]string{"Authorization": "Bearer custom-token", "X-Custom": "custom-value"},
+			assertRequest: func(t *testing.T, req *http.Request) {
+				require.Equal(t, "Bearer custom-token", req.Header.Get("Authorization"))
+				require.Equal(t, "custom-value", req.Header.Get("X-Custom"))
+			},
+		},
+		"authHeader preserved when not overridden": {
+			authHeader: "Bearer token123",
+			headers:    map[string]string{"X-Custom": "custom-value"},
+			assertRequest: func(t *testing.T, req *http.Request) {
+				require.Equal(t, "Bearer token123", req.Header.Get("Authorization"))
+				require.Equal(t, "custom-value", req.Header.Get("X-Custom"))
+			},
+		},
 	}
 
-	_, err := httpSync.Fetch(context.Background())
-	require.NoError(t, err)
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			mockClient := syncmock.NewMockClient(ctrl)
+
+			mockClient.EXPECT().Do(gomock.Any()).DoAndReturn(func(req *http.Request) (*http.Response, error) {
+				tt.assertRequest(t, req)
+				return &http.Response{
+					Header:     buildHeaders(map[string][]string{"Content-Type": {"application/json"}}),
+					Body:       io.NopCloser(strings.NewReader("{}")),
+					StatusCode: http.StatusOK,
+				}, nil
+			})
+
+			httpSync := Sync{
+				uri:        "http://localhost",
+				client:     mockClient,
+				authHeader: tt.authHeader,
+				headers:    tt.headers,
+				logger:     logger.NewLogger(nil, false),
+			}
+
+			_, err := httpSync.Fetch(context.Background())
+			require.NoError(t, err)
+		})
+	}
 }
 
 func TestHTTPSync_Resync(t *testing.T) {
