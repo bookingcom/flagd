@@ -35,11 +35,7 @@ func buildHeaders(m map[string][]string) http.Header {
 
 func TestSimpleSync(t *testing.T) {
 	ctrl := gomock.NewController(t)
-	mockCron := synctesting.NewMockCron(ctrl)
-	mockCron.EXPECT().AddFunc(gomock.Any(), gomock.Any()).DoAndReturn(func(_ string, _ func()) error {
-		return nil
-	})
-	mockCron.EXPECT().Start().Times(1)
+	mockPoller := synctesting.NewMockPoller()
 
 	mockClient := syncmock.NewMockClient(ctrl)
 	responseBody := "test response"
@@ -53,13 +49,13 @@ func TestSimpleSync(t *testing.T) {
 	httpSync := Sync{
 		uri:         "http://localhost/flags",
 		client:      mockClient,
-		cron:        mockCron,
+		poller:      mockPoller,
 		lastBodySHA: "",
 		logger:      logger.NewLogger(nil, false),
 	}
 
 	ctx := context.Background()
-	dataSyncChan := make(chan sync.DataSync)
+	dataSyncChan := make(chan sync.DataSync, 1)
 
 	go func() {
 		err := httpSync.Sync(ctx, dataSyncChan)
@@ -78,11 +74,7 @@ func TestSimpleSync(t *testing.T) {
 
 func TestExtensionWithQSSync(t *testing.T) {
 	ctrl := gomock.NewController(t)
-	mockCron := synctesting.NewMockCron(ctrl)
-	mockCron.EXPECT().AddFunc(gomock.Any(), gomock.Any()).DoAndReturn(func(_ string, _ func()) error {
-		return nil
-	})
-	mockCron.EXPECT().Start().Times(1)
+	mockPoller := synctesting.NewMockPoller()
 
 	mockClient := syncmock.NewMockClient(ctrl)
 	responseBody := "test response"
@@ -96,13 +88,13 @@ func TestExtensionWithQSSync(t *testing.T) {
 	httpSync := Sync{
 		uri:         "http://localhost/flags.json?env=dev",
 		client:      mockClient,
-		cron:        mockCron,
+		poller:      mockPoller,
 		lastBodySHA: "",
 		logger:      logger.NewLogger(nil, false),
 	}
 
 	ctx := context.Background()
-	dataSyncChan := make(chan sync.DataSync)
+	dataSyncChan := make(chan sync.DataSync, 1)
 
 	go func() {
 		err := httpSync.Sync(ctx, dataSyncChan)
@@ -328,6 +320,83 @@ func TestHTTPSync_Fetch(t *testing.T) {
 	}
 }
 
+func TestNewHTTP_PassesHeaders(t *testing.T) {
+	headers := map[string]string{"x-custom": "value"}
+	config := sync.SourceConfig{
+		URI:      "http://localhost",
+		Provider: "http",
+		Headers:  headers,
+	}
+	httpSync := NewHTTP(config, logger.NewLogger(nil, false), nil, 5)
+	require.Equal(t, map[string]string{"X-Custom": "value"}, httpSync.headers)
+}
+
+func TestHTTPSync_CustomHeaders(t *testing.T) {
+	tests := map[string]struct {
+		authHeader     string
+		headers        map[string]string
+		assertRequest  func(t *testing.T, req *http.Request)
+	}{
+		"injects custom headers": {
+			headers: map[string]string{"X-Interop-Gateway-Host": "myhost", "X-Tenant-ID": "tenant1"},
+			assertRequest: func(t *testing.T, req *http.Request) {
+				require.Equal(t, "myhost", req.Header.Get("X-Interop-Gateway-Host"))
+				require.Equal(t, "tenant1", req.Header.Get("X-Tenant-ID"))
+			},
+		},
+		"sets Host header via req.Host": {
+			headers: map[string]string{"Host": "custom-host.example.com"},
+			assertRequest: func(t *testing.T, req *http.Request) {
+				require.Equal(t, "custom-host.example.com", req.Host)
+				require.Empty(t, req.Header.Get("Host"))
+			},
+		},
+		"custom headers override authHeader": {
+			authHeader: "Bearer original-token",
+			headers:    map[string]string{"Authorization": "Bearer custom-token", "X-Custom": "custom-value"},
+			assertRequest: func(t *testing.T, req *http.Request) {
+				require.Equal(t, "Bearer custom-token", req.Header.Get("Authorization"))
+				require.Equal(t, "custom-value", req.Header.Get("X-Custom"))
+			},
+		},
+		"authHeader preserved when not overridden": {
+			authHeader: "Bearer token123",
+			headers:    map[string]string{"X-Custom": "custom-value"},
+			assertRequest: func(t *testing.T, req *http.Request) {
+				require.Equal(t, "Bearer token123", req.Header.Get("Authorization"))
+				require.Equal(t, "custom-value", req.Header.Get("X-Custom"))
+			},
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			mockClient := syncmock.NewMockClient(ctrl)
+
+			mockClient.EXPECT().Do(gomock.Any()).DoAndReturn(func(req *http.Request) (*http.Response, error) {
+				tt.assertRequest(t, req)
+				return &http.Response{
+					Header:     buildHeaders(map[string][]string{"Content-Type": {"application/json"}}),
+					Body:       io.NopCloser(strings.NewReader("{}")),
+					StatusCode: http.StatusOK,
+				}, nil
+			})
+
+			httpSync := Sync{
+				uri:        "http://localhost",
+				client:     mockClient,
+				authHeader: tt.authHeader,
+				headers:    tt.headers,
+				logger:     logger.NewLogger(nil, false),
+			}
+
+			_, err := httpSync.Fetch(context.Background())
+			require.NoError(t, err)
+		})
+	}
+}
+
 func TestHTTPSync_Resync(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	source := "http://localhost"
@@ -479,7 +548,7 @@ func TestHTTPSync_getClient(t *testing.T) {
 	l := logger.NewLogger(nil, false)
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			httpSync := NewHTTP(tt.config, l)
+			httpSync := NewHTTP(tt.config, l, synctesting.NewMockPoller(), 5)
 			if tt.client != nil {
 				// we have a cached HTTP client already
 				httpSync.client = tt.client
@@ -557,7 +626,7 @@ func TestHTTPSync_OAuth(t *testing.T) {
 			defer ts.Close()
 			l := logger.NewLogger(nil, false)
 			s := NewHTTP(sync.SourceConfig{
-				URI:         ts.URL,
+				URI:        ts.URL,
 				AuthHeader: "Bearer it_should_be_replaced_by_oauth",
 				OAuth: &sync.OAuthCredentialHandler{
 					ClientID:     clientID,
@@ -565,7 +634,7 @@ func TestHTTPSync_OAuth(t *testing.T) {
 					TokenURL:     ts.URL + oauthPath,
 					ReloadDelayS: 10000,
 				},
-			}, l)
+			}, l, synctesting.NewMockPoller(), 5)
 			d := make(chan sync.DataSync, 1)
 			// when we call resync multiple times
 			err := s.ReSync(context.Background(), d)
@@ -620,11 +689,14 @@ func TestHTTPSync_OAuthFolderSecrets(t *testing.T) {
 			return
 		} else if strings.HasSuffix(r.URL.Path, flagsPath) {
 			// mock flags response
-			io.ReadAll(r.Body)
+			_, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("cannot read request: %v", err)
+			}
 
 			w.WriteHeader(http.StatusOK)
 			w.Header().Set("Content-Type", "application/json")
-			_, err := w.Write([]byte(fmt.Sprintf(`{"flagKey": {"default": true}}`)))
+			_, err = w.Write([]byte(fmt.Sprintf(`{"flagKey": {"default": true}}`)))
 			if err != nil {
 				t.Fatalf("cannot write response: %v", err)
 			}
@@ -650,7 +722,7 @@ func TestHTTPSync_OAuthFolderSecrets(t *testing.T) {
 
 	l := logger.NewLogger(nil, false)
 	s := NewHTTP(sync.SourceConfig{
-		URI:         ts.URL + flagsPath,
+		URI:        ts.URL + flagsPath,
 		AuthHeader: "Bearer it_should_be_replaced_by_oauth",
 		OAuth: &sync.OAuthCredentialHandler{
 			ClientID:     clientID,
@@ -659,7 +731,7 @@ func TestHTTPSync_OAuthFolderSecrets(t *testing.T) {
 			TokenURL:     ts.URL + oauthPath,
 			ReloadDelayS: 0, // we force loading the secret at each req
 		},
-	}, l)
+	}, l, synctesting.NewMockPoller(), 5)
 	d := make(chan sync.DataSync, 2)
 	// when we fire the HTTP call
 	err = s.ReSync(context.Background(), d)

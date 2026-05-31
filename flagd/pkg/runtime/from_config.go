@@ -46,6 +46,8 @@ type Config struct {
 
 	ContextValues              map[string]any
 	HeaderToContextKeyMappings map[string]string
+	MaxRequestBodyBytes        int64
+	MaxRequestHeaderBytes      int64
 }
 
 // FromConfig builds a runtime from startup configurations
@@ -81,6 +83,9 @@ func FromConfig(logger *logger.Logger, version string, config Config) (*Runtime,
 
 	sources := []string{}
 
+	// URIs are registered verbatim (including any blob query string like
+	// s3://bucket/key?use_path_style=true); the sync implementation must
+	// emit DataSync.Source matching this exact string. See flagd#1973.
 	for _, provider := range config.SyncProviders {
 		sources = append(sources, provider.URI)
 	}
@@ -105,10 +110,12 @@ func FromConfig(logger *logger.Logger, version string, config Config) (*Runtime,
 
 	// ofrep service
 	ofrepService, err := ofrep.NewOfrepService(jsonEvaluator, config.CORS, ofrep.SvcConfiguration{
-		Logger: logger.WithFields(zap.String("component", "OFREPService")),
-		Port:   config.OfrepServicePort,
-		ServiceName: svcName,
-		MetricsRecorder: recorder,
+		Logger:                logger.WithFields(zap.String("component", "OFREPService")),
+		Port:                  config.OfrepServicePort,
+		ServiceName:           svcName,
+		MetricsRecorder:       recorder,
+		MaxRequestBodyBytes:   config.MaxRequestBodyBytes,
+		MaxRequestHeaderBytes: config.MaxRequestHeaderBytes,
 	},
 		config.ContextValues,
 		config.HeaderToContextKeyMappings,
@@ -129,6 +136,7 @@ func FromConfig(logger *logger.Logger, version string, config Config) (*Runtime,
 		SocketPath:          config.SyncServiceSocketPath,
 		StreamDeadline:      config.StreamDeadline,
 		DisableSyncMetadata: config.DisableSyncMetadata,
+		MetricsRecorder:     recorder,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("error creating sync service: %w", err)
@@ -165,6 +173,8 @@ func FromConfig(logger *logger.Logger, version string, config Config) (*Runtime,
 			ContextValues:              config.ContextValues,
 			HeaderToContextKeyMappings: config.HeaderToContextKeyMappings,
 			StreamDeadline:             config.StreamDeadline,
+			MaxRequestBodyBytes:        config.MaxRequestBodyBytes,
+			MaxRequestHeaderBytes:      config.MaxRequestHeaderBytes,
 		},
 		Syncs: iSyncs,
 	}, nil

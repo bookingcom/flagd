@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"regexp"
 	"strings"
 	"time"
 
@@ -32,13 +31,8 @@ const (
 	// evaluation if the user did not supply the optional bucketing property.
 	targetingKeyKey = "targetingKey"
 	Disabled        = "DISABLED"
+	ProtoVersionKey = "__flagd.protoVersion__" // used to mark if the request is coming from an older proto source, which has different fallback behavior
 )
-
-var regBrace *regexp.Regexp
-
-func init() {
-	regBrace = regexp.MustCompile("^[^{]*{|}[^}]*$")
-}
 
 func addSchemaResource(compiler *jsonschema.Compiler, url string, schemaData string) error {
 	unmarshalJSON, err := jsonschema.UnmarshalJSON(strings.NewReader(schemaData))
@@ -136,7 +130,7 @@ func (je *JSON) SetState(payload sync.DataSync) error {
 		return err
 	}
 
-	je.store.Update(payload.Source, definition.Flags, definition.Metadata)
+	je.store.Update(payload.Source, definition.Flags, definition.Metadata, payload.IncrementalUpdates)
 
 	return nil
 }
@@ -196,6 +190,13 @@ func (je *Resolver) ResolveAllValues(ctx context.Context, reqID string, context 
 			value, variant, reason, metadata, err = resolve[float64](ctx, reqID, flag.Key, context, je.evaluateVariant)
 		case map[string]any:
 			value, variant, reason, metadata, err = resolve[map[string]any](ctx, reqID, flag.Key, context, je.evaluateVariant)
+		default:
+			if ctx.Value(ProtoVersionKey) == nil {
+				value, variant, reason, metadata, err = resolve[interface{}](ctx, reqID, flag.Key, context, je.evaluateVariant)
+			} else {
+				// old proto version behavior
+				continue
+			}
 		}
 		if err != nil {
 			je.Logger.ErrorWithID(reqID, fmt.Sprintf("bulk evaluation: key: %s returned error: %s", flag.Key, err.Error()))
@@ -307,6 +308,11 @@ func resolve[T constraints](ctx context.Context, reqID string, key string, conte
 		return value, variant, reason, metadata, err
 	}
 
+	if reason == model.FallbackReason {
+		var zero T
+		return zero, variant, model.FallbackReason, metadata, nil
+	}
+
 	var ok bool
 	value, ok = variants[variant].(T)
 	if !ok {
@@ -380,7 +386,12 @@ func (je *Resolver) evaluateVariant(ctx context.Context, reqID string, flagKey s
 
 		if trimmed == "null" {
 			if flag.DefaultVariant == "" {
-				return "", flag.Variants, model.ErrorReason, metadata, errors.New(model.FlagNotFoundErrorCode)
+				if ctx.Value(ProtoVersionKey) != nil {
+					// old proto version behavior
+					return "", flag.Variants, model.ErrorReason, metadata, errors.New(model.FlagNotFoundErrorCode)
+				}
+
+				return "", flag.Variants, model.FallbackReason, metadata, nil
 			}
 
 			return flag.DefaultVariant, flag.Variants, model.DefaultReason, metadata, nil
@@ -399,7 +410,11 @@ func (je *Resolver) evaluateVariant(ctx context.Context, reqID string, flagKey s
 	}
 
 	if flag.DefaultVariant == "" {
-		return "", flag.Variants, model.ErrorReason, metadata, errors.New(model.FlagNotFoundErrorCode)
+		if ctx.Value(ProtoVersionKey) != nil {
+			// old proto version behavior
+			return "", flag.Variants, model.ErrorReason, metadata, errors.New(model.FlagNotFoundErrorCode)
+		}
+		return "", flag.Variants, model.FallbackReason, metadata, nil
 	}
 
 	return flag.DefaultVariant, flag.Variants, model.StaticReason, metadata, nil
@@ -526,13 +541,18 @@ func transposeEvaluators(state string) (string, error) {
 		return "", fmt.Errorf("unmarshal: %w", err)
 	}
 
-	for evalName, evalRaw := range evaluators.Evaluators {
-		// replace any occurrences of "evaluator": "evalName"
-		regex, err := regexp.Compile(fmt.Sprintf(`"\$ref":(\s)*"%s"`, evalName))
-		if err != nil {
-			return "", fmt.Errorf("compile regex: %w", err)
-		}
+	// round-trip to normalize whitespace so we can use plain string matching
+	var raw interface{}
+	if err := json.Unmarshal([]byte(state), &raw); err != nil {
+		return "", fmt.Errorf("normalize: %w", err)
+	}
+	normalizedBytes, err := json.Marshal(raw)
+	if err != nil {
+		return "", fmt.Errorf("normalize marshal: %w", err)
+	}
+	result := string(normalizedBytes)
 
+	for evalName, evalRaw := range evaluators.Evaluators {
 		marshalledEval, err := evalRaw.MarshalJSON()
 		if err != nil {
 			return "", fmt.Errorf("marshal evaluator: %w", err)
@@ -542,9 +562,10 @@ func transposeEvaluators(state string) (string, error) {
 		if len(evalValue) < 3 {
 			return "", errors.New("evaluator object is empty")
 		}
-		evalValue = regBrace.ReplaceAllString(evalValue, "")
-		state = regex.ReplaceAllString(state, evalValue)
+
+		refPattern := `{"$ref":"` + evalName + `"}`
+		result = strings.ReplaceAll(result, refPattern, evalValue)
 	}
 
-	return state, nil
+	return result, nil
 }

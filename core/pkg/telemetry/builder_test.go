@@ -44,24 +44,7 @@ func TestBuildMetricReader(t *testing.T) {
 			error: false,
 		},
 		{
-			name: "Metric exporter overriding require valid overriding parameter",
-			cfg: Config{
-				MetricsExporter: "unsupported",
-			},
-			error: true,
-		},
-		{
-			name: "Metric exporter overriding require valid configuration combination",
-			cfg: Config{
-				MetricsExporter: metricsExporterOtel,
-				CollectorConfig: CollectorConfig{
-					Target: "", // collector target is unset
-				},
-			},
-			error: true,
-		},
-		{
-			name: "Metric exporter overriding with valid configurations",
+			name: "Autoexport handles all configurations",
 			cfg: Config{
 				MetricsExporter: metricsExporterOtel,
 				CollectorConfig: CollectorConfig{
@@ -128,9 +111,9 @@ func TestBuildConnectOptions(t *testing.T) {
 		optionCount int
 	}{
 		{
-			name:        "No options for empty/default configurations",
+			name:        "Interceptor always added with autoexport",
 			cfg:         Config{},
-			optionCount: 0,
+			optionCount: 1,
 		},
 		{
 			name: "Connect option is set when telemetry target is set",
@@ -170,6 +153,23 @@ func TestBuildResourceFor(t *testing.T) {
 		Key:   semconv.ServiceVersionKey,
 		Value: attribute.StringValue(svcVersion),
 	}, "expected resource to contain service version")
+}
+
+func TestBuildResourceForEnvOverride(t *testing.T) {
+	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "service.version=9.9.9,service.name=overridden-svc")
+
+	res, err := buildResourceFor(context.Background(), "defaultSvc", "0.0.1")
+	require.Nil(t, err, "expected no error, but got: %v", err)
+
+	attributes := res.Attributes()
+	require.Containsf(t, attributes, attribute.KeyValue{
+		Key:   semconv.ServiceNameKey,
+		Value: attribute.StringValue("overridden-svc"),
+	}, "expected OTEL_RESOURCE_ATTRIBUTES to override the programmatic service name")
+	require.Containsf(t, attributes, attribute.KeyValue{
+		Key:   semconv.ServiceVersionKey,
+		Value: attribute.StringValue("9.9.9"),
+	}, "expected OTEL_RESOURCE_ATTRIBUTES to override the programmatic service version")
 }
 
 func TestErrorIntercepted(t *testing.T) {

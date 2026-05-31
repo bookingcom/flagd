@@ -15,8 +15,8 @@ import (
 
 	"github.com/open-feature/flagd/core/pkg/logger"
 	"github.com/open-feature/flagd/core/pkg/sync"
+	"github.com/open-feature/flagd/core/pkg/sync/internal/polling"
 	"github.com/open-feature/flagd/core/pkg/utils"
-	"github.com/robfig/cron"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/sha3" //nolint:gosec
 	"golang.org/x/oauth2"
@@ -26,10 +26,11 @@ import (
 type Sync struct {
 	uri         string
 	client      Client
-	cron        Cron
+	poller      polling.Poller
 	lastBodySHA string
 	logger      *logger.Logger
 	authHeader  string
+	headers     map[string]string
 	interval    uint32
 	ready       bool
 	eTag        string
@@ -89,13 +90,6 @@ type Client interface {
 	Do(req *http.Request) (*http.Response, error)
 }
 
-// Cron defines the behaviour required of a cron
-type Cron interface {
-	AddFunc(spec string, cmd func()) error
-	Start()
-	Stop()
-}
-
 func (hs *Sync) ReSync(ctx context.Context, dataSync chan<- sync.DataSync) error {
 	msg, _, err := hs.fetchBody(ctx, true)
 	if err != nil {
@@ -114,7 +108,10 @@ func (hs *Sync) IsReady() bool {
 }
 
 func (hs *Sync) Sync(ctx context.Context, dataSync chan<- sync.DataSync) error {
+	hs.logger.Info(fmt.Sprintf("starting sync from %s (interval: %ds)", hs.uri, hs.interval))
+
 	// Initial fetch
+	hs.logger.Debug(fmt.Sprintf("initial fetch from %s", hs.uri))
 	fetch, _, err := hs.fetchBody(ctx, true)
 	if err != nil {
 		return err
@@ -123,8 +120,11 @@ func (hs *Sync) Sync(ctx context.Context, dataSync chan<- sync.DataSync) error {
 	// Set ready state
 	hs.ready = true
 
-	hs.logger.Debug(fmt.Sprintf("polling %s every %d seconds", hs.uri, hs.interval))
-	_ = hs.cron.AddFunc(fmt.Sprintf("*/%d * * * *", hs.interval), func() {
+	hs.logger.Debug(fmt.Sprintf("polling %s every %ds (offset: %ds)", hs.uri, hs.interval, hs.poller.Offset()))
+
+	dataSync <- sync.DataSync{FlagData: fetch, Source: hs.uri}
+
+	hs.poller.Start(ctx, func() {
 		hs.logger.Debug(fmt.Sprintf("fetching configuration from %s", hs.uri))
 		previousBodySHA := hs.lastBodySHA
 		body, noChange, err := hs.fetchBody(ctx, false)
@@ -147,14 +147,17 @@ func (hs *Sync) Sync(ctx context.Context, dataSync chan<- sync.DataSync) error {
 		}
 	})
 
-	hs.cron.Start()
-
-	dataSync <- sync.DataSync{FlagData: fetch, Source: hs.uri}
-
-	<-ctx.Done()
-	hs.cron.Stop()
-
 	return nil
+}
+
+func (hs *Sync) applyHeaders(req *http.Request) {
+	for key, value := range hs.headers {
+		if http.CanonicalHeaderKey(key) == "Host" {
+			req.Host = value
+		} else {
+			req.Header.Set(key, value)
+		}
+	}
 }
 
 func (hs *Sync) fetchBody(ctx context.Context, fetchAll bool) (string, bool, error) {
@@ -177,6 +180,9 @@ func (hs *Sync) fetchBody(ctx context.Context, fetchAll bool) (string, bool, err
 	if hs.eTag != "" && !fetchAll {
 		req.Header.Set("If-None-Match", hs.eTag)
 	}
+
+	hs.applyHeaders(req)
+
 	client := hs.getClient()
 	resp, err := client.Do(req)
 	if err != nil {
@@ -267,13 +273,7 @@ func (hs *Sync) getClient() Client {
 	return client
 }
 
-func NewHTTP(config sync.SourceConfig, logger *logger.Logger) *Sync {
-	// Default to 5 seconds
-	var interval uint32 = 5
-	if config.Interval != 0 {
-		interval = config.Interval
-	}
-
+func NewHTTP(config sync.SourceConfig, logger *logger.Logger, poller polling.Poller, interval uint32) *Sync {
 	var oauthCredential *oauthCredentialHandler
 	if config.OAuth != nil {
 		oauthCredential = &oauthCredentialHandler{
@@ -286,6 +286,11 @@ func NewHTTP(config sync.SourceConfig, logger *logger.Logger) *Sync {
 		}
 	}
 
+	canonicalHeaders := make(map[string]string, len(config.Headers))
+	for k, v := range config.Headers {
+		canonicalHeaders[http.CanonicalHeaderKey(k)] = v
+	}
+
 	return &Sync{
 		uri: config.URI,
 		logger: logger.WithFields(
@@ -293,8 +298,9 @@ func NewHTTP(config sync.SourceConfig, logger *logger.Logger) *Sync {
 			zap.String("sync", "http"),
 		),
 		authHeader:      config.AuthHeader,
+		headers:         canonicalHeaders,
 		interval:        interval,
-		cron:            cron.New(),
+		poller:          poller,
 		oauthCredential: oauthCredential,
 		timeoutS:        time.Duration(config.TimeoutS),
 	}
