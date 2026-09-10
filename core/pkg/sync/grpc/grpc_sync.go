@@ -13,6 +13,8 @@ import (
 	"github.com/open-feature/flagd/core/pkg/sync"
 	grpccredential "github.com/open-feature/flagd/core/pkg/sync/grpc/credentials"
 	_ "github.com/open-feature/flagd/core/pkg/sync/grpc/nameresolvers" // initialize custom resolvers e.g. envoy.Init()
+	"github.com/open-feature/flagd/core/pkg/sync/syncmetrics"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
@@ -55,11 +57,22 @@ type Sync struct {
 	IncrementalUpdates      bool
 	Headers                 map[string]string
 
-	client FlagSyncServiceClient
-	ready  atomic.Bool
+	// SyncMetricsRecorder, when non-nil, is used to record the source-agnostic
+	// client-side sync metrics (feature_flag.flagd.sync.client.flag_config.*). Nil is
+	// safe — the recorder's methods tolerate nil receivers.
+	SyncMetricsRecorder *syncmetrics.Recorder
+
+	client        FlagSyncServiceClient
+	ready         atomic.Bool
+	streamMetrics *clientStreamMetrics
 }
 
 func (g *Sync) Init(_ context.Context) error {
+	// Build the gRPC-client-specific stream-lifecycle recorder off the global MeterProvider
+	// (telemetry.NewOTelRecorder registers it globally via otel.SetMeterProvider). Nil is
+	// safe — the returned recorder degrades to no-ops.
+	g.streamMetrics = newClientStreamMetrics(nil)
+
 	var rpcCon *grpc.ClientConn // Reusable client connection
 	var err error
 
@@ -75,13 +88,17 @@ func (g *Sync) Init(_ context.Context) error {
 			return err
 		}
 
+		// Instrument the outbound sync channel (flagd -> flag-server) so that standard
+		// rpc.client.* metrics land on the same reader as flagd's other metrics.
+		statsHandler := grpc.WithStatsHandler(otelgrpc.NewClientHandler())
+
 		// Set MaxMsgSize if passed
 		if g.MaxMsgSize > 0 {
 			g.Logger.Info(fmt.Sprintf("setting max receive message size %d bytes default 4MB", g.MaxMsgSize))
 			dialOptions := grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(g.MaxMsgSize))
-			rpcCon, err = grpc.NewClient(g.URI, grpc.WithTransportCredentials(tCredentials), dialOptions)
+			rpcCon, err = grpc.NewClient(g.URI, grpc.WithTransportCredentials(tCredentials), dialOptions, statsHandler)
 		} else {
-			rpcCon, err = grpc.NewClient(g.URI, grpc.WithTransportCredentials(tCredentials))
+			rpcCon, err = grpc.NewClient(g.URI, grpc.WithTransportCredentials(tCredentials), statsHandler)
 		}
 	}
 
@@ -115,6 +132,7 @@ func (g *Sync) ReSync(ctx context.Context, dataSync chan<- sync.DataSync) error 
 		g.Logger.Error(err.Error())
 		return err
 	}
+	g.SyncMetricsRecorder.RecordFlagConfigApplied(ctx, syncmetrics.SourceGRPC, g.URI, g.Selector)
 	dataSync <- sync.DataSync{
 		FlagData:           res.GetFlagConfiguration(),
 		Source:             g.URI,
@@ -136,11 +154,13 @@ func (g *Sync) Sync(ctx context.Context, dataSync chan<- sync.DataSync) error {
 	if err != nil {
 		return fmt.Errorf("unable to sync flags: %w", err)
 	}
+	g.streamMetrics.recordStreamOpened(ctx, g.URI, g.Selector)
 
 	g.Logger.Debug(fmt.Sprintf("watching %s for changes", g.URI))
 
 	// Initial stream listening. Error will be logged and continue and retry connection establishment
-	err = g.handleFlagSync(syncClient, dataSync)
+	err = g.handleFlagSync(ctx, syncClient, dataSync)
+	g.streamMetrics.recordStreamClosed(ctx, g.URI, g.Selector)
 	if err == nil {
 		// This should not happen as handleFlagSync expects to return with an error
 		return nil
@@ -155,8 +175,11 @@ func (g *Sync) Sync(ctx context.Context, dataSync chan<- sync.DataSync) error {
 			// We shall exit
 			return nil
 		}
+		g.streamMetrics.recordStreamOpened(ctx, g.URI, g.Selector)
+		g.streamMetrics.recordReconnect(ctx, g.URI, g.Selector)
 
-		err = g.handleFlagSync(syncClient, dataSync)
+		err = g.handleFlagSync(ctx, syncClient, dataSync)
+		g.streamMetrics.recordStreamClosed(ctx, g.URI, g.Selector)
 		if err != nil {
 			g.Logger.Warn(fmt.Sprintf("error with stream listener: %s", err.Error()))
 			continue
@@ -205,7 +228,7 @@ func (g *Sync) connectWithRetry(
 }
 
 // handleFlagSync wraps the stream listening and push updates through dataSync channel
-func (g *Sync) handleFlagSync(stream syncv1grpc.FlagSyncService_SyncFlagsClient, dataSync chan<- sync.DataSync) error {
+func (g *Sync) handleFlagSync(ctx context.Context, stream syncv1grpc.FlagSyncService_SyncFlagsClient, dataSync chan<- sync.DataSync) error {
 	g.ready.Store(true)
 
 	for {
@@ -213,6 +236,8 @@ func (g *Sync) handleFlagSync(stream syncv1grpc.FlagSyncService_SyncFlagsClient,
 		if err != nil {
 			return fmt.Errorf("error receiving payload from stream: %w", err)
 		}
+
+		g.SyncMetricsRecorder.RecordFlagConfigApplied(ctx, syncmetrics.SourceGRPC, g.URI, g.Selector)
 
 		dataSync <- sync.DataSync{
 			FlagData:           data.FlagConfiguration,

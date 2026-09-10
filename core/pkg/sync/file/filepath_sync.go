@@ -13,6 +13,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"github.com/open-feature/flagd/core/pkg/logger"
 	"github.com/open-feature/flagd/core/pkg/sync"
+	"github.com/open-feature/flagd/core/pkg/sync/syncmetrics"
 	"github.com/open-feature/flagd/core/pkg/utils"
 )
 
@@ -46,6 +47,9 @@ type Sync struct {
 	watcher        Watcher
 	ready          bool
 	Mux            *msync.RWMutex
+
+	// SyncMetricsRecorder is the source-agnostic client-side sync-metrics recorder. Nil is safe.
+	SyncMetricsRecorder *syncmetrics.Recorder
 }
 
 func NewFileSync(uri string, watchType string, pollIntervalMs int, logger *logger.Logger) *Sync {
@@ -193,6 +197,7 @@ func (fs *Sync) sendDataSync(ctx context.Context, dataSync chan<- sync.DataSync)
 		msg = m
 	}
 
+	fs.SyncMetricsRecorder.RecordFlagConfigApplied(ctx, syncmetrics.SourceFile, fs.URI, "")
 	dataSync <- sync.DataSync{FlagData: msg, Source: fs.URI}
 }
 
