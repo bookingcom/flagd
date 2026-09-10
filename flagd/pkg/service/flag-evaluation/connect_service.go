@@ -258,7 +258,7 @@ func (s *ConnectService) startServer(ctx context.Context, svcConf service.Config
 	if err != nil {
 		return err
 	}
-	s.logger.Info(fmt.Sprintf("Flag IResolver listening at %s", lis.Addr()))
+	s.logger.Info(fmt.Sprintf("[Test] Flag IResolver listening at %s", lis.Addr()))
 
 	if svcConf.CertPath != "" && svcConf.KeyPath != "" {
 		return serveWithShutdown(ctx, s.server, func() error {
